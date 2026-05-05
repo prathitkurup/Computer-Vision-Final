@@ -62,20 +62,20 @@ def visualize_results(results, num_display=3):
     for caption, images, labels, similarity in results[:num_display]:
         n = len(images)
         fig, axes = plt.subplots(1, n + 1, figsize=(4 * (n + 1), 4))
-        fig.suptitle(caption[:100], fontsize=9)
+        fig.suptitle(f"Caption: {caption}", fontsize=24)
 
         for i, (img, label, score) in enumerate(zip(images, labels, similarity)):
             axes[i].imshow(img)
             tag = "REAL" if label == 0 else "AI"
             color = "green" if label == 0 else "red"
-            axes[i].set_title(f"{tag}\n{score:.3f}", fontsize=9, color=color)
+            axes[i].set_title(f"{tag}\n{score:.3f}", fontsize=18, color=color)
             axes[i].axis("off")
 
         bar_colors = ["green" if l == 0 else "red" for l in labels]
         x_labels = [f"{'REAL' if l == 0 else 'AI'}{i + 1}" for i, l in enumerate(labels)]
         axes[-1].bar(x_labels, similarity, color=bar_colors)
-        axes[-1].set_ylabel("CLIP similarity")
-        axes[-1].set_title("Scores by image")
+        axes[-1].set_ylabel("CLIP Similarity")
+        axes[-1].set_title("Scores By Image")
         plt.tight_layout()
         plt.show()
 
@@ -88,7 +88,7 @@ def main():
     print(f"Total caption groups: {len(caption_groups)}")
 
     results = analyze_clip_confidence(hf_split, caption_groups, num_samples=50)
-    visualize_results(results, num_display=3)
+    visualize_results(results, num_display=50)
 
 
 if __name__ == "__main__":
