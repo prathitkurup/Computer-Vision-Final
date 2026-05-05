@@ -13,13 +13,17 @@ Outline:
 5) Test the model on the test set to compare performance
     5a) Quantitative: compare the classification accuracy of both models
     5b) Qualitatively: visually compare the images
+6) Implement GradCam and analyze heatmaps for model weight focus
+7) SEE NEXT SCRIPT: Implement CLIP to match captions and images and identify confidence
 '''
 
-from datasets import load_dataset
+
+from tqdm import tqdm
 import torchvision.transforms as transforms
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets
+from torchvision.datasets import load_dataset
 import torch.nn as nn
 from torchvision.io import read_image
 from torchsummary import summary
@@ -60,7 +64,8 @@ class HFImageDataset(Dataset):
         if self.transform:
             img = self.transform(img)
         label = item["Label_A"]   # 0 = Real, 1 = AI-Generated
-        return img, label
+        caption = item["Caption"]
+        return img, label, caption
 
 def create_data_loader(transform=None):
     '''Create PyTorch DataLoaders for the training and test sets.'''
@@ -102,18 +107,20 @@ def train_model(model, model_name, train_dl):
     start_time = time.time()
     print(f"\nBegin training for: {model_name}")
     for epoch in range(N_EPOCHS):
-        print(f"{model_name}: epoch {epoch + 1} of {N_EPOCHS}")
         epoch_losses = []
         correct = 0
         total = 0
+        print(f"{model_name}: epoch {epoch + 1} of {N_EPOCHS}")
 
-        for x, y in train_dl:
+        batch_bar = tqdm(train_dl, desc=f"{model_name} epoch {epoch+1}/{N_EPOCHS}", leave=True)
+        for x, y in batch_bar:
             x = x.to(device)
             y = y.to(device)
             batch_loss, preds = train_batch(x, y, model, opt, loss_fn)
             epoch_losses.append(batch_loss.item())
             correct += (preds == y).sum().item()
             total += y.size(0)
+            batch_bar.set_postfix(loss=f"{batch_loss.item():.4f}", acc=f"{correct/total:.4f}")
 
         epoch_loss = float(np.mean(epoch_losses))
         epoch_accuracy = correct / total
@@ -140,7 +147,7 @@ def accuracy(x, y, model):
 def test_model(model, model_name,test_dl):
     '''Evaluate the model on the test set and print the average accuracy.'''
     accs = []
-    for x, y in test_dl:
+    for x, y in tqdm(test_dl, desc=f"{model_name} testing", leave=True):
         x, y = x.to(device), y.to(device)
         accs.append(accuracy(x, y, model))
     print(f"{model_name} test accuracy: {np.mean(accs)}")
@@ -175,7 +182,7 @@ def run_conv_layers(dl, model):
     # Run convolutional layers once to extract features using the pre-trained weights
     features = []
     labels = []
-    for x, y in dl:
+    for x, y in tqdm(dl, desc="Extracting features", leave=True):
         x = x.to(device)
         outputs = model(x)      # run CNN forward once
         outputs = torch.flatten(outputs, start_dim=1)
@@ -189,26 +196,9 @@ def run_conv_layers(dl, model):
     # This is the data we will train the MLP on
     return torch.cat(features), torch.cat(labels)
 
-# def extract_resnet_features(resnet, x):
-#     feats = resnet.conv1(x)
-#     feats = resnet.bn1(feats)
-#     feats = resnet.relu(feats)
-#     feats = resnet.maxpool(feats)
-#     feats = resnet.layer1(feats)
-#     feats = resnet.layer2(feats)
-#     feats = resnet.layer3(feats)
-#     feats = resnet.layer4(feats)
-#     feats = resnet.avgpool(feats)
-#     feats = torch.flatten(feats, 1) # [B, C*H*W]
-#     return feats
-
-def run_experiment(model, model_weights, model_name):
+def run_classification(model, model_name, train_dl, test_dl):
     '''Run the full training and evaluation pipeline for a given pre-trained model and return the trained backbone and MLP classifier.'''
     print(f"\nRunning experiment for {model_name}")
-
-    # Dataset using the correct preprocessing
-    model_transformations = model_weights.transforms()
-    train_dl, test_dl = create_data_loader(model_transformations)
 
     # Remove classifier from backbone for ResNet50 feature extraction
     model.fc = nn.Identity()
@@ -284,11 +274,10 @@ def get_gradcam(mlp, backbone, img_tensor, genre_tensor):
         p.requires_grad_(True)
 
     img  = img_tensor.unsqueeze(0).to(device)
-    gen  = genre_tensor.unsqueeze(0).to(device)
 
     with torch.enable_grad():
         feat_flat = torch.flatten(backbone(img), 1)          # [1, 2048]
-        pred      = mlp(torch.cat([feat_flat, gen], dim=1)).squeeze()
+        pred      = mlp(feat_flat).squeeze()
         backbone.zero_grad()
         mlp.zero_grad()
         pred.backward()
@@ -312,7 +301,7 @@ def get_gradcam(mlp, backbone, img_tensor, genre_tensor):
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
     return cam
 
-def show_gradcam_grid(mlp, backbone, dataset, indices=None, n=19,alpha_heatmap=0.45, colormap="jet"):
+def show_gradcam_grid(mlp, backbone, model_weights, indices=None, n=4,alpha_heatmap=0.45, colormap="jet"):
     """
     Plots n images each shown as:
       LEFT  — raw image(AI or Real)  +  true class label vs. predicted class label
@@ -323,11 +312,15 @@ def show_gradcam_grid(mlp, backbone, dataset, indices=None, n=19,alpha_heatmap=0
     alpha_heatmap : blend strength of the heatmap (0 = invisible, 1 = full)
     colormap  : matplotlib colormap name ('jet', 'hot', 'plasma', etc.)
     """
+    model_transformations = model_weights.transforms()
+    ds = load_dataset("Rajarshi-Roy-research/Defactify_Image_Dataset")
+    test_dataset = HFImageDataset(ds["test"], transform=model_transformations)
+
+    
     # Grab raw image from hugging face dataset, not drive, also need to change output to show classification results instead of regression results
     # Need to update this for our binary classification task — show predicted vs. true label instead of gross, and change the title accordingly
-    dataset = create_data_loaders(True)
     if indices is None:
-        indices = np.random.choice(len(dataset), size=n, replace=False).tolist()
+        indices = np.random.choice(len(test_dataset), size=n, replace=False)
     else:
         n = len(indices)
 
@@ -338,15 +331,15 @@ def show_gradcam_grid(mlp, backbone, dataset, indices=None, n=19,alpha_heatmap=0
 
     mlp.eval()
     backbone.eval()
-
+    class_names = {0:"Real", 1:"AI-Generated"}
     for row, idx in enumerate(indices):
-        img_tensor, class_label, _ = dataset[idx]
+        img_tensor, true_label, _ = test_dataset[idx]
 
-        raw_pil = Image.open(dataset.paths[idx]).convert("RGB")
+        raw_pil = Image.open(test_dataset.paths[idx]).convert("RGB")
         img_np  = np.array(raw_pil) / 255.0
 
         # Grad-CAM
-        cam = get_gradcam(mlp, backbone, img_tensor, genre_tensor)
+        cam = get_gradcam(mlp, backbone, img_tensor)
 
         # Upsample 7×7 --> image resolution
         cam_up = np.array(
@@ -361,20 +354,17 @@ def show_gradcam_grid(mlp, backbone, dataset, indices=None, n=19,alpha_heatmap=0
         # Predicted vs. true class
         with torch.no_grad():
             feat_flat = torch.flatten(backbone(img_tensor.unsqueeze(0).to(device)), 1)
-            pred_log  = mlp(
-                torch.cat([feat_flat,
-                           genre_tensor.unsqueeze(0).to(device)], dim=1)
-            ).item()
-
-        pred_class = pred_log
-        true_class = label.item()
+            pred_logit = mlp(feat_flat).item()
+            pred_label = 1 if pred_logit > 0 else 0
+        
+        
 
         # Plot
         axes[row][0].imshow(img_np)
         axes[row][0].set_title(
             f"Sample #{idx}\n"
-            f"True:  {true_class}\n"
-            f"Pred:  {pred_class}",
+            f"True:  {class_names[true_label]}\n"
+            f"Pred:  {class_names[pred_label]} (pred_logit={pred_logit:.2f})",
             fontsize=8, family="monospace", loc="left"
         )
         axes[row][0].axis("off")
@@ -392,33 +382,26 @@ def show_gradcam_grid(mlp, backbone, dataset, indices=None, n=19,alpha_heatmap=0
     plt.tight_layout()
     plt.show()
 
+
 def main():
     # Transfer learning with ResNet-50
     resnet50_weights = models.ResNet50_Weights.IMAGENET1K_V1
     resnet50_model = models.resnet50(weights=resnet50_weights)
-    resnet50_backbone, resnet50_mlp = run_experiment(
+    resnet_model_transformations = resnet50_weights.transforms()
+    resnet_train_dl, resnet_test_dl = create_data_loader(resnet_model_transformations)
+
+    resnet50_backbone, resnet50_mlp = run_classification(
         model=resnet50_model,
-        model_weights=resnet50_weights,
-        model_name="ResNet50"
+        model_name="ResNet50",
+        train_dl=resnet_train_dl, 
+        test_dl=resnet_test_dl
     )
     
+    # Grad-CAM visualization examples:
+    # Mode 1 — 4 random test images
+    show_gradcam_grid(resnet50_mlp, resnet50_backbone, resnet50_weights, n=4)
 
-    #Grad Cam
-    # Mode 1 — 4 random test posters
-    # show_gradcam_grid(mlp, resnet_backbone, test_ds, n=4)
+    # Mode 2 — specific image indices you choose
+    # show_gradcam_grid(resnet50_mlp, resnet50_backbone, resnet50_weights, indices=[0, 12, 47, 99])
 
-    # Mode 2 — specific poster indices you choose
-    # show_gradcam_grid(mlp, resnet_backbone, test_ds, indices=[0, 12, 47, 99])
-
-    # Mode 3 — top-5 highest predicted grossing posters in the test set
-    # with torch.no_grad():
-    #     all_preds = []
-    #     for img_t, gen_t, _ in test_ds: # Removed vote_t
-    #         feat = torch.flatten(resnet_backbone(img_t.unsqueeze(0).to(device)), 1)
-    #         p = mlp(torch.cat([feat, gen_t.unsqueeze(0).to(device)], dim=1)).item() # Removed vote_t
-    #         all_preds.append(p)
-    # top20 = np.argsort(all_preds)[-5:][::-1].tolist()
-    # show_gradcam_grid(mlp, resnet_backbone, test_ds, indices=top20)
-
-def __innit__():
-    main()
+main()
